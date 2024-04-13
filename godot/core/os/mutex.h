@@ -1,47 +1,58 @@
-/*************************************************************************/
-/*  mutex.h                                                              */
-/*************************************************************************/
-/*                       This file is part of:                           */
-/*                           GODOT ENGINE                                */
-/*                      https://godotengine.org                          */
-/*************************************************************************/
-/* Copyright (c) 2007-2022 Juan Linietsky, Ariel Manzur.                 */
-/* Copyright (c) 2014-2022 Godot Engine contributors (cf. AUTHORS.md).   */
-/*                                                                       */
-/* Permission is hereby granted, free of charge, to any person obtaining */
-/* a copy of this software and associated documentation files (the       */
-/* "Software"), to deal in the Software without restriction, including   */
-/* without limitation the rights to use, copy, modify, merge, publish,   */
-/* distribute, sublicense, and/or sell copies of the Software, and to    */
-/* permit persons to whom the Software is furnished to do so, subject to */
-/* the following conditions:                                             */
-/*                                                                       */
-/* The above copyright notice and this permission notice shall be        */
-/* included in all copies or substantial portions of the Software.       */
-/*                                                                       */
-/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,       */
-/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF    */
-/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.*/
-/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY  */
-/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,  */
-/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE     */
-/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                */
-/*************************************************************************/
+/**************************************************************************/
+/*  mutex.h                                                               */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
 
 #ifndef MUTEX_H
 #define MUTEX_H
 
-#include "core/error_list.h"
+#include "core/error/error_macros.h"
 #include "core/typedefs.h"
 
-#if !defined(NO_THREADS)
-
+#ifdef MINGW_ENABLED
+#define MINGW_STDTHREAD_REDUNDANCY_WARNING
+#include "thirdparty/mingw-std-threads/mingw.mutex.h"
+#define THREADING_NAMESPACE mingw_stdthread
+#else
 #include <mutex>
+#define THREADING_NAMESPACE std
+#endif
+
+template <class MutexT>
+class MutexLock;
 
 template <class StdMutexT>
 class MutexImpl {
+	friend class MutexLock<MutexImpl<StdMutexT>>;
+
+	using StdMutexType = StdMutexT;
+
 	mutable StdMutexT mutex;
-	friend class MutexLock;
 
 public:
 	_ALWAYS_INLINE_ void lock() const {
@@ -52,69 +63,96 @@ public:
 		mutex.unlock();
 	}
 
-	_ALWAYS_INLINE_ Error try_lock() const {
-		return mutex.try_lock() ? OK : ERR_BUSY;
+	_ALWAYS_INLINE_ bool try_lock() const {
+		return mutex.try_lock();
 	}
 };
 
-// This is written this way instead of being a template to overcome a limitation of C++ pre-17
-// that would require MutexLock to be used like this: MutexLock<Mutex> lock;
-class MutexLock {
-	union {
-		std::recursive_mutex *recursive_mutex;
-		std::mutex *mutex;
-	};
-	bool recursive;
+// A very special kind of mutex, used in scenarios where these
+// requirements hold at the same time:
+// - Must be used with a condition variable (only binary mutexes are suitable).
+// - Must have recursive semnantics (or simulate, as this one does).
+// The implementation keeps the lock count in TS. Therefore, only
+// one object of each version of the template can exists; hence the Tag argument.
+// Tags must be unique across the Godot codebase.
+// Also, don't forget to declare the thread_local variable on each use.
+template <int Tag>
+class SafeBinaryMutex {
+	friend class MutexLock<SafeBinaryMutex>;
+
+	using StdMutexType = THREADING_NAMESPACE::mutex;
+
+	mutable THREADING_NAMESPACE::mutex mutex;
+	static thread_local uint32_t count;
 
 public:
-	_ALWAYS_INLINE_ explicit MutexLock(const MutexImpl<std::recursive_mutex> &p_mutex) :
-			recursive_mutex(&p_mutex.mutex),
-			recursive(true) {
-		recursive_mutex->lock();
-	}
-	_ALWAYS_INLINE_ explicit MutexLock(const MutexImpl<std::mutex> &p_mutex) :
-			mutex(&p_mutex.mutex),
-			recursive(false) {
-		mutex->lock();
-	}
-
-	_ALWAYS_INLINE_ ~MutexLock() {
-		if (recursive) {
-			recursive_mutex->unlock();
-		} else {
-			mutex->unlock();
+	_ALWAYS_INLINE_ void lock() const {
+		if (++count == 1) {
+			mutex.lock();
 		}
 	}
-};
 
-using Mutex = MutexImpl<std::recursive_mutex>; // Recursive, for general use
-using BinaryMutex = MutexImpl<std::mutex>; // Non-recursive, handle with care
+	_ALWAYS_INLINE_ void unlock() const {
+		DEV_ASSERT(count);
+		if (--count == 0) {
+			mutex.unlock();
+		}
+	}
 
-extern template class MutexImpl<std::recursive_mutex>;
-extern template class MutexImpl<std::mutex>;
+	_ALWAYS_INLINE_ bool try_lock() const {
+		if (count) {
+			count++;
+			return true;
+		} else {
+			if (mutex.try_lock()) {
+				count++;
+				return true;
+			} else {
+				return false;
+			}
+		}
+	}
 
-#else
-
-class FakeMutex {
-	FakeMutex() {}
+	~SafeBinaryMutex() {
+		DEV_ASSERT(!count);
+	}
 };
 
 template <class MutexT>
-class MutexImpl {
-public:
-	_ALWAYS_INLINE_ void lock() const {}
-	_ALWAYS_INLINE_ void unlock() const {}
-	_ALWAYS_INLINE_ Error try_lock() const { return OK; }
-};
-
 class MutexLock {
+	friend class ConditionVariable;
+
+	THREADING_NAMESPACE::unique_lock<typename MutexT::StdMutexType> lock;
+
 public:
-	explicit MutexLock(const MutexImpl<FakeMutex> &p_mutex) {}
+	_ALWAYS_INLINE_ explicit MutexLock(const MutexT &p_mutex) :
+			lock(p_mutex.mutex){};
 };
 
-using Mutex = MutexImpl<FakeMutex>;
-using BinaryMutex = MutexImpl<FakeMutex>; // Non-recursive, handle with care
+// This specialization is needed so manual locking and MutexLock can be used
+// at the same time on a SafeBinaryMutex.
+template <int Tag>
+class MutexLock<SafeBinaryMutex<Tag>> {
+	friend class ConditionVariable;
 
-#endif // !NO_THREADS
+	THREADING_NAMESPACE::unique_lock<THREADING_NAMESPACE::mutex> lock;
+
+public:
+	_ALWAYS_INLINE_ explicit MutexLock(const SafeBinaryMutex<Tag> &p_mutex) :
+			lock(p_mutex.mutex) {
+		SafeBinaryMutex<Tag>::count++;
+	};
+	_ALWAYS_INLINE_ ~MutexLock() {
+		SafeBinaryMutex<Tag>::count--;
+	};
+};
+
+using Mutex = MutexImpl<THREADING_NAMESPACE::recursive_mutex>; // Recursive, for general use
+using BinaryMutex = MutexImpl<THREADING_NAMESPACE::mutex>; // Non-recursive, handle with care
+
+extern template class MutexImpl<THREADING_NAMESPACE::recursive_mutex>;
+extern template class MutexImpl<THREADING_NAMESPACE::mutex>;
+extern template class MutexLock<MutexImpl<THREADING_NAMESPACE::recursive_mutex>>;
+extern template class MutexLock<MutexImpl<THREADING_NAMESPACE::mutex>>;
 
 #endif // MUTEX_H
